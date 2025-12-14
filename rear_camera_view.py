@@ -21,6 +21,11 @@ from slot_pose import (
     lane_pair_to_slot_pose,
     slot_pose_to_corners
 )
+from auto_calibrate import (
+    auto_canny,
+    auto_hough_threshold,
+    auto_tune
+)
 
 TEST_IMAGE_PATH = "test_parking_1.jpg"
 
@@ -86,10 +91,18 @@ class ImageProcessor:
         self.blur = cv2.GaussianBlur(self.gray, (5, 5), 0)
         return self.blur
 
-    def step_edges(self):
+    def step_edges(self, use_auto_canny=True):
         if self.blur is None:
             self.step_blur()
-        self.edges = cv2.Canny(self.blur, 50, 150)
+        
+        if use_auto_canny:
+            # Adaptive Canny thresholds based on image brightness
+            self.edges, self.canny_thresholds = auto_canny(self.blur)
+        else:
+            # Fixed thresholds (original behavior)
+            self.edges = cv2.Canny(self.blur, 50, 150)
+            self.canny_thresholds = (50, 150)
+        
         return self.edges
 
     def process_all(self):
@@ -141,6 +154,9 @@ class App:
         self.lineA = None
         self.lineB = None
         self.slot = None
+        
+        # Auto-tuning state
+        self.use_auto_tune = IntVar(value=1)  # Enable by default
 
         # Checklist buttons
         self.steps_row1 = [
@@ -173,6 +189,11 @@ class App:
             chk = Checkbutton(self.control_frame, text="Done", variable=self.vars[var_idx], state="disabled")
             chk.grid(row=3, column=i)
 
+        
+        # Auto-tune checkbox (second row, rightmost)
+        self.auto_chk = Checkbutton(self.control_frame, text="Auto-Tune", 
+                                     variable=self.use_auto_tune)
+        self.auto_chk.grid(row=3, column=len(self.steps_row1)-1, sticky="e")
         # Button to process all (far right of second row)
         self.all_btn = Button(self.control_frame, text="Process All Steps", command=self.process_all)
         self.all_btn.grid(row=2, column=len(self.steps_row1)-1, padx=5, sticky="e")
@@ -253,7 +274,13 @@ class App:
         if self.processor is None:
             print("Please load an image first!")
             return
-        edges = self.processor.step_edges()
+        edges = self.processor.step_edges(use_auto_canny=True)
+        
+        # Show adaptive Canny thresholds
+        if self.processor.canny_thresholds:
+            lo, hi = self.processor.canny_thresholds
+            print(f"Auto-Canny thresholds: low={lo}, high={hi}")
+        
         self.proc_img = cv2_to_tk(edges)
         self.proc_panel.config(image=self.proc_img)
         self.proc_panel.image = self.proc_img
@@ -263,15 +290,41 @@ class App:
         if self.processor is None:
             print("Please load an image first!")
             return
-        edges = self.processor.step_edges()
-        params = self.processor.hough_params
-        detector = HoughLaneDetector(params)
-        line_img, segments = detector.detect(edges)
+        edges = self.processor.step_edges(use_auto_canny=True)
+        
+        if self.use_auto_tune.get():
+            # Auto-tuning mode: find best parameters
+            print("\n=== AUTO-TUNING ===")
+            
+            # Suggest Hough threshold based on edge density
+            auto_thr = auto_hough_threshold(edges)
+            print(f"Suggested Hough threshold from edge density: {auto_thr}")
+            
+            # Run grid search to find best parameters
+            base_params = self.processor.hough_params.copy()
+            best_params, line_img, segments, score = auto_tune(
+                HoughLaneDetector, edges, base_params, verbose=True
+            )
+            
+            # Update processor params with best found
+            self.processor.hough_params.update(best_params)
+            
+            # Update slider UI to reflect auto-tuned values
+            for key in ['threshold', 'angle_pair_th']:
+                if key in best_params and key in self.param_vars:
+                    self.param_vars[key].set(int(best_params[key]))
+            
+            print(f"\n✓ Auto-tuned: {len(segments)} segments, score={score:.1f}")
+            print(f"  → Sliders updated: threshold={best_params['threshold']}, angle_pair_th={best_params['angle_pair_th']:.1f}")
+        else:
+            # Manual mode: use current parameters
+            params = self.processor.hough_params
+            detector = HoughLaneDetector(params)
+            line_img, segments = detector.detect(edges)
+            print(f"\nDetected {len(segments)} lane segments (manual params)")
 
         # Store segments for next steps
         self.segments = segments
-
-        print(f"\nDetected {len(segments)} lane segments")
 
         self.proc_img = cv2_to_tk(line_img)
         self.proc_panel.config(image=self.proc_img)
@@ -427,6 +480,33 @@ class App:
         print(f"  Width: {self.slot['width']:.1f} pixels")
         print(f"  Length: {self.slot['length']:.1f} pixels")
         print("=" * 60)
+
+        # Add text overlay in right bottom corner with red color
+        H, W = line_img.shape[:2]
+        text_lines = [
+            "PARKING SLOT DETECTED:",
+            f"  Center: ({cx:.1f}, {cy:.1f}) pixels",
+            f"  Orientation: {np.degrees(theta):.1f}°",
+            f"  Width: {self.slot['width']:.1f} pixels",
+            f"  Length: {self.slot['length']:.1f} pixels"
+        ]
+        
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        thickness = 1
+        color = (0, 0, 255)  # Red in BGR
+        line_height = 20
+        
+        # Calculate starting position (right bottom corner with padding)
+        padding = 10
+        y_start = H - padding - len(text_lines) * line_height
+        
+        for i, text in enumerate(text_lines):
+            y_pos = y_start + i * line_height
+            # Get text size to align from right
+            (text_width, text_height), _ = cv2.getTextSize(text, font, font_scale, thickness)
+            x_pos = W - text_width - padding
+            cv2.putText(line_img, text, (x_pos, y_pos), font, font_scale, color, thickness, cv2.LINE_AA)
 
         self.proc_img = cv2_to_tk(line_img)
         self.proc_panel.config(image=self.proc_img)
