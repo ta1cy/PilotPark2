@@ -46,33 +46,67 @@ def fit_line_to_segments(segments):
     """
     Takes a list of segments and uses Least Squares to find the best fit line.
     Returns: (a, b, c, angle) for ax + by + c = 0
+    
+    Includes filtering to remove outliers:
+    - Horizon filter: ignore segments in top 40% of image
+    - Length filter: ignore tiny segments < 15 pixels
+    - Weighting: longer segments have more influence
+    - Robust fitting: uses DIST_HUBER to resist outliers
     """
     if not segments:
         return None
 
-    # Collect all start and end points of the segments
     points = []
+    
+    # --- FILTER CONFIGURATION ---
+    # 1. Horizon Line: Ignore anything in the top 40% of the image
+    #    (Assuming image height is ~360px based on your screenshot)
+    HORIZON_Y = 140 
+    
+    # 2. Min Length: Ignore tiny noise specks (less than 15 pixels)
+    MIN_LENGTH = 15 
+
     for s in segments:
         x1, y1, x2, y2 = s
+        
+        # FILTER 1: HORIZON CHECK
+        # If both points are too high up, skip this segment completely.
+        if y1 < HORIZON_Y and y2 < HORIZON_Y:
+            continue
+            
+        # FILTER 2: LENGTH CHECK
+        # Calculate how long the segment is
+        length = np.hypot(x2 - x1, y2 - y1)
+        if length < MIN_LENGTH:
+            continue
+
+        # If it passes filters, add it to the math pile
         points.append([x1, y1])
         points.append([x2, y2])
+        
+        # WEIGHTING: Add longer lines more times so they have more "gravity"
+        # This makes the line "stick" to the real lane markings
+        if length > 30:
+            points.append([x1, y1])
+            points.append([x2, y2])
+            points.append([(x1+x2)/2, (y1+y2)/2]) # Add midpoint
+
+    # If we filtered everything out, return None
+    if len(points) < 2:
+        return None
     
-    points = np.array(points, dtype=np.float32)
+    points = np.array(points)
     
-    # Fit a line using OpenCV's fitLine (Distance based, robust to noise)
-    # DIST_L2 is standard Least Squares
-    vx, vy, x0, y0 = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01)
+    # --- ROBUST FITTING ---
+    # Use DIST_HUBER instead of DIST_L2. 
+    # Huber ignores outliers (like that one remaining noise pixel) much better.
+    vx, vy, x0, y0 = cv2.fitLine(points, cv2.DIST_HUBER, 0, 0.01, 0.01)
     
-    # Convert vector (vx, vy) and point (x0, y0) to General Form: ax + by + c = 0
-    # Slope m = vy / vx. 
-    # General form is -vy*x + vx*y + (vy*x0 - vx*y0) = 0
-    
+    # Convert to General Form (ax + by + c = 0)
     a = -vy[0]
     b = vx[0]
     c = vy[0] * x0[0] - vx[0] * y0[0]
-    
-    # Calculate angle for reference
-    angle = math.degrees(math.atan2(vy[0], vx[0]))
+    angle = math.atan2(vy[0], vx[0])
     
     return (a, b, c, angle)
 
@@ -555,15 +589,16 @@ class App:
             if len(points) >= 2:
                 cv2.line(img, points[0], points[1], color, 2)
 
-        draw_fitted_line(line_img, self.lineA, (0, 255, 255))  # green
-        draw_fitted_line(line_img, self.lineB, (255, 255, 0))  # cyan
+        draw_fitted_line(line_img, self.lineA, (255, 0, 0))  # blue
+        draw_fitted_line(line_img, self.lineB, (0, 0, 255))  # red
 
-        print("Fitted lines drawn: green (boundary 1) and cyan (boundary 2)")
+        print("Fitted lines drawn: blue (boundary 1) and red (boundary 2)")
 
         self.proc_img = cv2_to_tk(line_img)
         self.proc_panel.config(image=self.proc_img)
         self.proc_panel.image = self.proc_img
         self.vars[6].set(1)
+
 
     def show_pose_extraction(self):
         if self.lineA is None or self.lineB is None:
