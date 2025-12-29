@@ -470,42 +470,52 @@ class App:
         # Create clean black image for clustering visualization
         H, W = self.processor.edges.shape[:2]
         line_img = np.zeros((H, W, 3), dtype=np.uint8)
+        
+        # Calculate center vertical line
+        mid_x = W / 2
 
         import math
 
-        # --- NEW LOGIC: Cluster by Angle (Slope) ---
+        # --- NEW LOGIC: Cluster by Length + Angle + Position ---
         group1 = [] # Left Lines (Green)
         group2 = [] # Right Lines (Cyan)
         
-        # Temporary lists to help fit the infinite lines later (lineA, lineB)
-        group1_segments = []
-        group2_segments = []
+        # --- SETTING: Minimum Segment Length ---
+        # Any line shorter than 20 pixels is considered "Noise/Dot"
+        MIN_SEGMENT_LENGTH = 20
 
         for s in self.segments:
             x1, y1, x2, y2 = s
             
-            # 1. Calculate Angle in Degrees
-            # atan2 returns -180 to 180
+            # 1. FILTER: LENGTH CHECK (Remove Dots)
+            length = np.hypot(x2 - x1, y2 - y1)
+            if length < MIN_SEGMENT_LENGTH:
+                continue  # Skip this loop iteration, throw away the dot!
+            
+            # Calculate Midpoint of the segment
+            mx = (x1 + x2) / 2
+            
+            # Calculate Angle in Degrees
             angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
             
-            # 2. Filter Logic
-            # Note: Image coordinates (0,0 at top-left) means:
-            # Right Line (\) is usually +45 to +85 degrees
-            # Left Line (/) is usually -45 to -85 degrees
-            
-            # CHECK FOR RIGHT LINE (Cyan) - Slanting \
-            if 20 < angle < 85:
-                group2.append(s)
-                group2_segments.append(s)
-                
-            # CHECK FOR LEFT LINE (Green) - Slanting /
-            # Also handle the wrap-around case if line points up vs down
-            elif -85 < angle < -20:
+            # 2. FILTER: LEFT LANE (Green)
+            # Criteria: 
+            # - Angle is negative (slanted /)
+            # - Position is on the LEFT side of the screen
+            if -85 < angle < -20 and mx < mid_x:
                 group1.append(s)
-                group1_segments.append(s)
+                
+            # 3. FILTER: RIGHT LANE (Cyan)
+            # Criteria:
+            # - Angle is positive (slanted \)
+            # - Position is on the RIGHT side of the screen
+            elif 20 < angle < 85 and mx > mid_x:
+                group2.append(s)
                 
             # Horizontal lines (-20 to 20) are IGNORED (Noise)
             # Vertical lines (>85) are IGNORED (Noise)
+            # Lines on wrong side of screen are IGNORED
+            # Short segments (<20px) are IGNORED (Dots)
 
         # --- DRAWING ---
         for s in group1:
@@ -516,11 +526,10 @@ class App:
             x1, y1, x2, y2 = s
             cv2.line(line_img, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 255), 2)  # Cyan (Right)
 
-        print(f"Clustered by Angle: {len(group1)} (Left/Green) and {len(group2)} (Right/Cyan)")
+        print(f"Clustered by Length + Angle + Position: {len(group1)} (Left/Green) and {len(group2)} (Right/Cyan)")
 
-        # --- THE MISSING CALCULATION STEP ---
-        # We must turn the LIST of segments into a single MATHEMATICAL line (a,b,c)
-        # and store it in self.lineA / self.lineB so the next function can use it.
+        # --- FIT LINES ---
+        # Turn the LIST of segments into a single MATHEMATICAL line (a,b,c)
         
         if len(group1) > 0:
             self.lineA = fit_line_to_segments(group1)  # Updates the Left Line
@@ -594,6 +603,9 @@ class App:
 
         print("Fitted lines drawn: blue (boundary 1) and red (boundary 2)")
 
+        # Store fitted line image for pose extraction step
+        self.fitted_line_img = line_img.copy()
+
         self.proc_img = cv2_to_tk(line_img)
         self.proc_panel.config(image=self.proc_img)
         self.proc_panel.image = self.proc_img
@@ -604,76 +616,85 @@ class App:
         if self.lineA is None or self.lineB is None:
             print("Run Segment Clustering first!")
             return
-
-        # Use clustering visualization as background
-        if not hasattr(self, 'clustering_img') or self.clustering_img is None:
-            print("Run Segment Clustering first!")
-            return
             
-        # Copy clustering image to draw fitted lines on top
-        line_img = self.clustering_img.copy()
-
-        # Compute slot pose
-        self.slot = lane_pair_to_slot_pose(self.lineA, self.lineB, line_img.shape, y_target_ratio=0.70)
-
-        if self.slot is None:
-            print("Could not compute slot pose from boundary lines")
+        # Use fitted line visualization as background
+        if not hasattr(self, 'fitted_line_img') or self.fitted_line_img is None:
+            print("Run Line Fitting first!")
             return
-
-        corners = slot_pose_to_corners(self.slot)
-
-        # Draw the slot box
-        pts = np.array(corners, dtype=np.int32).reshape(-1, 1, 2)
-        cv2.polylines(line_img, [pts], isClosed=True, color=(255, 0, 0), thickness=2)
-
-        # Draw center point
-        cx, cy = self.slot["center"]
-        cv2.circle(line_img, (int(cx), int(cy)), 5, (0, 0, 255), -1)
-
-        # Draw orientation arrow
-        arrow_len = 30
-        theta = self.slot["theta"]
-        ex = int(cx + arrow_len * np.cos(theta))
-        ey = int(cy + arrow_len * np.sin(theta))
-        cv2.arrowedLine(line_img, (int(cx), int(cy)), (ex, ey), 
-                       (0, 255, 255), 2, tipLength=0.3)
-
+        
+        # 1. GET ANGLES OF THE SIDE LINES
+        # line = (a, b, c, angle) -> ax + by + c = 0
+        # Slope m = -a/b. Angle = atan2(-a, b)
+        
+        a1, b1, c1, _ = self.lineA
+        a2, b2, c2, _ = self.lineB
+        
+        # Calculate angle of each line in degrees
+        # Note: We assume lines point "Up" (-Y direction)
+        angle1 = math.degrees(math.atan2(-a1, b1))
+        angle2 = math.degrees(math.atan2(-a2, b2))
+        
+        # Fix quadrant wrapping so we can average them
+        # (e.g. ensure both are negative like -60 and -120)
+        if angle1 > 0: 
+            angle1 -= 180
+        if angle2 > 0: 
+            angle2 -= 180
+            
+        # 2. CALCULATE PARKING ORIENTATION
+        # The car should drive along the bisector (average)
+        orientation_deg = (angle1 + angle2) / 2.0
+        
+        # 3. CALCULATE CENTER & WIDTH AT BOTTOM (Entrance)
+        H, W = self.fitted_line_img.shape[:2]
+        y_bottom = H  # The bottom of the image
+        
+        # Calculate x-intercept at the bottom for both lines
+        # ax + by + c = 0  ->  x = -(by + c) / a
+        
+        # Avoid divide by zero
+        if abs(a1) < 1e-6: 
+            x1_bottom = 0 
+        else: 
+            x1_bottom = -(b1 * y_bottom + c1) / a1
+            
+        if abs(a2) < 1e-6: 
+            x2_bottom = W
+        else: 
+            x2_bottom = -(b2 * y_bottom + c2) / a2
+            
+        center_x = (x1_bottom + x2_bottom) / 2.0
+        center_y = y_bottom
+        
+        spot_width = abs(x2_bottom - x1_bottom)
+        
+        # --- VISUALIZATION ---
+        # Create a copy of fitted line image to draw on
+        pose_img = self.fitted_line_img.copy()
+        
+        # Draw Center Point
+        cx, cy = int(center_x), int(center_y - 50)  # Draw slightly up from bottom
+        cv2.circle(pose_img, (cx, cy), 10, (0, 0, 255), -1)  # Red Dot
+        
+        # Draw Orientation Arrow
+        # Calculate arrow tip using the orientation
+        arrow_len = 100
+        angle_rad = math.radians(orientation_deg)
+        tip_x = cx + arrow_len * math.cos(angle_rad)
+        tip_y = cy + arrow_len * math.sin(angle_rad)
+        
+        cv2.arrowedLine(pose_img, (cx, cy), (int(tip_x), int(tip_y)), (0, 255, 255), 5)  # Yellow Arrow
+        
+        # Print Results
         print("=" * 60)
         print("PARKING SLOT DETECTED:")
-        print(f"  Center: ({cx:.1f}, {cy:.1f}) pixels")
-        print(f"  Orientation: {np.degrees(theta):.1f}°")
-        print(f"  Width: {self.slot['width']:.1f} pixels")
-        print(f"  Length: {self.slot['length']:.1f} pixels")
+        print(f"  Center: ({center_x:.1f}, {center_y:.1f})")
+        print(f"  Orientation: {orientation_deg:.1f}° (Target Heading)")
+        print(f"  Width: {spot_width:.1f} pixels")
         print("=" * 60)
-
-        # Add text overlay in right bottom corner with red color
-        H, W = line_img.shape[:2]
-        text_lines = [
-            "PARKING SLOT DETECTED:",
-            f"  Center: ({cx:.1f}, {cy:.1f}) pixels",
-            f"  Orientation: {np.degrees(theta):.1f}°",
-            f"  Width: {self.slot['width']:.1f} pixels",
-            f"  Length: {self.slot['length']:.1f} pixels"
-        ]
         
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.5
-        thickness = 1
-        color = (0, 0, 255)  # Red in BGR
-        line_height = 20
-        
-        # Calculate starting position (right bottom corner with padding)
-        padding = 10
-        y_start = H - padding - len(text_lines) * line_height
-        
-        for i, text in enumerate(text_lines):
-            y_pos = y_start + i * line_height
-            # Get text size to align from right
-            (text_width, text_height), _ = cv2.getTextSize(text, font, font_scale, thickness)
-            x_pos = W - text_width - padding
-            cv2.putText(line_img, text, (x_pos, y_pos), font, font_scale, color, thickness, cv2.LINE_AA)
-
-        self.proc_img = cv2_to_tk(line_img)
+        # Update GUI
+        self.proc_img = cv2_to_tk(pose_img)
         self.proc_panel.config(image=self.proc_img)
         self.proc_panel.image = self.proc_img
         self.vars[7].set(1)
