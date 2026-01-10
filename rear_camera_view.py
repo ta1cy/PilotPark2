@@ -32,14 +32,35 @@ import math
 
 
 def cv2_to_tk(img):
-    """Convert OpenCV image (BGR or GRAY) to a Tkinter PhotoImage."""
+    """Convert OpenCV image (BGR or GRAY) to a Tkinter PhotoImage.
+    Maintains aspect ratio and centers the image with black padding."""
     if len(img.shape) == 2:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
     else:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    
+    # Target display size
+    target_w, target_h = 400, 300
+    
+    # Get original dimensions
+    orig_h, orig_w = img.shape[:2]
+    
+    # Calculate scaling factor to fit within target while maintaining aspect ratio
+    scale = min(target_w / orig_w, target_h / orig_h)
+    new_w = int(orig_w * scale)
+    new_h = int(orig_h * scale)
+    
+    # Resize image maintaining aspect ratio
     pil_img = Image.fromarray(img)
-    pil_img = pil_img.resize((400, 300))
-    return ImageTk.PhotoImage(pil_img)
+    pil_img = pil_img.resize((new_w, new_h), Image.LANCZOS)
+    
+    # Create black canvas and paste centered image
+    canvas = Image.new('RGB', (target_w, target_h), (0, 0, 0))
+    offset_x = (target_w - new_w) // 2
+    offset_y = (target_h - new_h) // 2
+    canvas.paste(pil_img, (offset_x, offset_y))
+    
+    return ImageTk.PhotoImage(canvas)
 
 
 def fit_line_to_segments(segments):
@@ -285,12 +306,15 @@ class App:
         self.lineB = None
         self.slot = None
         
-        # Auto-tuning state
-        self.use_auto_tune = IntVar(value=1)  # Enable by default
+        # Video mode state
+        self.video_mode = False
+        self.video_cap = None
+        self.video_playing = False
+        self.continuous_processing = False  # For continuous frame processing
 
         # Checklist buttons
         self.steps_row1 = [
-            ("Load Image", self.load_image),
+            ("Load Image/Video", self.load_image),
             ("Convert to Grayscale", self.show_gray),
             ("Gaussian Blur", self.show_blur),
             ("Binarize (White Lanes)", self.show_binary),
@@ -304,10 +328,15 @@ class App:
         
         self.vars = [IntVar() for _ in range(len(self.steps_row1) + len(self.steps_row2))]
         
+        # Store button references for enabling/disabling
+        self.step_buttons = []
+        
         # First row of buttons
         for i, (name, func) in enumerate(self.steps_row1):
             btn = Button(self.control_frame, text=name, command=func)
             btn.grid(row=0, column=i, padx=5)
+            if i > 0:  # Don't disable the Load button
+                self.step_buttons.append(btn)
             chk = Checkbutton(self.control_frame, text="Done", variable=self.vars[i], state="disabled")
             chk.grid(row=1, column=i)
         
@@ -316,14 +345,10 @@ class App:
             var_idx = len(self.steps_row1) + i
             btn = Button(self.control_frame, text=name, command=func)
             btn.grid(row=2, column=i, padx=5)
+            self.step_buttons.append(btn)
             chk = Checkbutton(self.control_frame, text="Done", variable=self.vars[var_idx], state="disabled")
             chk.grid(row=3, column=i)
-
         
-        # Auto-tune checkbox (second row, rightmost)
-        self.auto_chk = Checkbutton(self.control_frame, text="Auto-Tune", 
-                                     variable=self.use_auto_tune)
-        self.auto_chk.grid(row=3, column=len(self.steps_row1)-1, sticky="e")
         # Button to process all (far right of second row)
         self.all_btn = Button(self.control_frame, text="Process All Steps", command=self.process_all)
         self.all_btn.grid(row=2, column=len(self.steps_row1)-1, padx=5, sticky="e")
@@ -335,9 +360,10 @@ class App:
 
     def load_image(self):
         file_path = filedialog.askopenfilename(
-            title="Select Parking Image",
+            title="Select Parking Image or Video",
             filetypes=[
                 ("Image files", "*.jpg *.jpeg *.png *.bmp"),
+                ("Video files", "*.mp4 *.avi *.mov *.mkv"),
                 ("All files", "*.*")
             ],
             initialdir="samples"
@@ -346,45 +372,135 @@ class App:
         if not file_path:
             return
         
-        img = cv2.imread(file_path)
-        if img is None:
-            print(f"Error: Could not load image at {file_path}")
+        # Check if it's a video file
+        video_extensions = ['.mp4', '.avi', '.mov', '.mkv']
+        is_video = any(file_path.lower().endswith(ext) for ext in video_extensions)
+        
+        if is_video:
+            # Load video
+            self.load_video(file_path)
+        else:
+            # Load image (existing behavior)
+            img = cv2.imread(file_path)
+            if img is None:
+                print(f"Error: Could not load image at {file_path}")
+                return
+            
+            # Reset video mode if switching from video to image
+            if self.video_mode:
+                self.video_mode = False
+                if self.video_cap is not None:
+                    self.video_cap.release()
+                    self.video_cap = None
+                # Re-enable all buttons
+                for btn in self.step_buttons:
+                    btn.config(state="normal")
+            
+            # Update current image and processor
+            self.current_img = img
+            self.processor = ImageProcessor(img)
+            
+            # Reset all checkboxes
+            for v in self.vars:
+                v.set(0)
+            
+            # Reset state
+            self.segments = None
+            self.lineA = None
+            self.lineB = None
+            self.slot = None
+            
+            # Update window titles with resolution
+            orig_h, orig_w = img.shape[:2]
+            proc_h, proc_w = self.processor.img.shape[:2]
+            self.orig_label.config(text=f"Original Image - {orig_w}x{orig_h}")
+            self.proc_label.config(text=f"Processed Image - {proc_w}x{proc_h}")
+            
+            # Display original image
+            self.orig_img = cv2_to_tk(img)
+            self.orig_panel.config(image=self.orig_img)
+            self.orig_panel.image = self.orig_img
+            
+            # Show ROI crop in processed panel
+            roi = self.processor.step_crop()
+            self.proc_img = cv2_to_tk(roi)
+            self.proc_panel.config(image=self.proc_img)
+            self.proc_panel.image = self.proc_img
+            
+            print(f"Loaded image: {file_path}")
+            print(f"Image size: {img.shape[1]}x{img.shape[0]}")
+            self.vars[0].set(1)
+    
+    def load_video(self, file_path):
+        """Load and play video file."""
+        # Release previous video if any
+        if self.video_cap is not None:
+            self.video_cap.release()
+        
+        # Open video file
+        self.video_cap = cv2.VideoCapture(file_path)
+        if not self.video_cap.isOpened():
+            print(f"Error: Could not open video at {file_path}")
             return
         
-        # Update current image and processor
-        self.current_img = img
-        self.processor = ImageProcessor(img)
+        # Get video properties
+        fps = self.video_cap.get(cv2.CAP_PROP_FPS)
+        frame_count = int(self.video_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(self.video_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(self.video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         
-        # Reset all checkboxes
+        print(f"\nLoaded video: {file_path}")
+        print(f"Video size: {width}x{height}")
+        print(f"FPS: {fps}, Total frames: {frame_count}")
+        
+        # Enable video mode
+        self.video_mode = True
+        self.video_playing = False
+        
+        # Update window title
+        self.orig_label.config(text=f"Video Playback - {width}x{height} @ {fps:.1f} FPS")
+        
+        # Disable all step buttons except Process All
+        for btn in self.step_buttons:
+            btn.config(state="disabled")
+        
+        # Reset checkboxes
         for v in self.vars:
             v.set(0)
         
-        # Reset state
-        self.segments = None
-        self.lineA = None
-        self.lineB = None
-        self.slot = None
-        
-        # Update window titles with resolution
-        orig_h, orig_w = img.shape[:2]
-        proc_h, proc_w = self.processor.img.shape[:2]
-        self.orig_label.config(text=f"Original Image - {orig_w}x{orig_h}")
-        self.proc_label.config(text=f"Processed Image - {proc_w}x{proc_h}")
-        
-        # Display original image
-        self.orig_img = cv2_to_tk(img)
-        self.orig_panel.config(image=self.orig_img)
-        self.orig_panel.image = self.orig_img
-        
-        # Show ROI crop in processed panel
-        roi = self.processor.step_crop()
-        self.proc_img = cv2_to_tk(roi)
-        self.proc_panel.config(image=self.proc_img)
-        self.proc_panel.image = self.proc_img
-        
-        print(f"Loaded image: {file_path}")
-        print(f"Image size: {img.shape[1]}x{img.shape[0]}")
+        # Check the "Done" checkbox for Load Image/Video step
         self.vars[0].set(1)
+        
+        # Start video playback
+        self.play_video()
+    
+    def play_video(self):
+        """Play video frames in the original image panel."""
+        if not self.video_mode or self.video_cap is None:
+            return
+        
+        self.video_playing = True
+        
+        def show_frame():
+            if not self.video_playing or not self.video_mode:
+                return
+            
+            ret, frame = self.video_cap.read()
+            if ret:
+                # Display frame in original panel
+                self.orig_img = cv2_to_tk(frame)
+                self.orig_panel.config(image=self.orig_img)
+                self.orig_panel.image = self.orig_img
+                
+                # Schedule next frame (30ms ~ 33fps)
+                self.root.after(30, show_frame)
+            else:
+                # Video ended, stop playback
+                self.video_playing = False
+                self.continuous_processing = False
+                print("Video playback ended")
+        
+        show_frame()
 
     def show_lane_mask(self):
         if self.processor is None:
@@ -700,16 +816,83 @@ class App:
         self.vars[7].set(1)
 
     def process_all(self):
-        if self.processor is None:
-            print("Please load an image first!")
+        if self.video_mode:
+            # Start continuous video processing
+            if self.video_cap is None:
+                print("No video loaded!")
+                return
+            
+            if not self.video_playing:
+                print("Video playback has ended!")
+                return
+            
+            # Enable continuous processing
+            self.continuous_processing = True
+            print("Started continuous frame processing (100ms interval)")
+            
+            # Start the processing loop
+            self.process_video_frame()
+        else:
+            # Process image (existing behavior)
+            if self.processor is None:
+                print("Please load an image first!")
+                return
+            self.processor.process_all()
+            self.show_edges()
+            self.show_clustering()
+            self.show_line_fitting()
+            self.show_pose_extraction()
+            for v in self.vars:
+                v.set(1)
+    
+    def process_video_frame(self):
+        """Process current video frame continuously every 100ms."""
+        # Check if we should stop
+        if not self.continuous_processing or not self.video_playing or not self.video_mode:
+            print("Stopped continuous frame processing")
             return
-        self.processor.process_all()
-        self.show_edges()
-        self.show_clustering()
-        self.show_line_fitting()
-        self.show_pose_extraction()
-        for v in self.vars:
-            v.set(1)
+        
+        # Get current frame position
+        current_pos = self.video_cap.get(cv2.CAP_PROP_POS_FRAMES)
+        
+        # Read frame without advancing position (peek)
+        ret, frame = self.video_cap.read()
+        if not ret:
+            print("Could not read frame from video!")
+            self.continuous_processing = False
+            return
+        
+        # Reset to current position for continued playback
+        self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, current_pos)
+        
+        # Process this frame
+        import time
+        try:
+            start_time = time.time()
+            
+            self.processor = ImageProcessor(frame)
+            self.processor.process_all()
+            self.show_edges()
+            self.show_clustering()
+            self.show_line_fitting()
+            self.show_pose_extraction()
+            for v in self.vars:
+                v.set(1)
+            
+            # Calculate processing time
+            end_time = time.time()
+            process_time_ms = int((end_time - start_time) * 1000)
+            
+            # Update title with processing time
+            H, W = self.processor.img.shape[:2]
+            self.proc_label.config(text=f"Processed Image - {W}x{H} - {process_time_ms}ms")
+            
+            print(f"Processed frame {int(current_pos)} in {process_time_ms}ms")
+        except Exception as e:
+            print(f"Error processing frame: {e}")
+        
+        # Schedule next processing after 100ms
+        self.root.after(100, self.process_video_frame)
 
     # ---- parameter UI ----
 
