@@ -80,12 +80,16 @@ def fit_line_to_segments(segments):
     points = []
     
     # --- FILTER CONFIGURATION ---
-    # 1. Horizon Line: Ignore anything in the top 40% of the image
-    #    (Assuming image height is ~360px based on your screenshot)
-    HORIZON_Y = 140 
+    # 1. Horizon Line: Ignore anything in the top 30% of the image
+    #    (Assuming image height is ~360px)
+    HORIZON_Y = 100
     
-    # 2. Min Length: Ignore tiny noise specks (less than 15 pixels)
-    MIN_LENGTH = 15 
+    # 2. Min Length: Ignore tiny noise specks (less than 10 pixels)
+    MIN_LENGTH = 10
+    
+    filtered_count = 0
+    horizon_filtered = 0
+    length_filtered = 0 
 
     for s in segments:
         x1, y1, x2, y2 = s
@@ -93,15 +97,18 @@ def fit_line_to_segments(segments):
         # FILTER 1: HORIZON CHECK
         # If both points are too high up, skip this segment completely.
         if y1 < HORIZON_Y and y2 < HORIZON_Y:
+            horizon_filtered += 1
             continue
             
         # FILTER 2: LENGTH CHECK
         # Calculate how long the segment is
         length = np.hypot(x2 - x1, y2 - y1)
         if length < MIN_LENGTH:
+            length_filtered += 1
             continue
 
         # If it passes filters, add it to the math pile
+        filtered_count += 1
         points.append([x1, y1])
         points.append([x2, y2])
         
@@ -114,6 +121,7 @@ def fit_line_to_segments(segments):
 
     # If we filtered everything out, return None
     if len(points) < 2:
+        print(f"  ⚠️ Line fitting failed: {filtered_count} segments passed filters but only {len(points)} points (horizon:{horizon_filtered}, length:{length_filtered})")
         return None
     
     points = np.array(points)
@@ -142,23 +150,45 @@ class ImageProcessor:
     CANONICAL_HEIGHT = 360
     
     def __init__(self, img):
-        # Step 0: Standardize input - center crop to canonical size
+        # Step 0: Standardize input - crop and resize to canonical size
         H, W = img.shape[:2]
         
         # Validate minimum size
         if H < self.CANONICAL_HEIGHT or W < self.CANONICAL_WIDTH:
             raise ValueError(f"Invalid image size {W}x{H}. Minimum required: {self.CANONICAL_WIDTH}x{self.CANONICAL_HEIGHT}")
         
-        # Center crop to canonical size
-        y_center = H // 2
-        x_center = W // 2
-        y0 = y_center - self.CANONICAL_HEIGHT // 2
-        x0 = x_center - self.CANONICAL_WIDTH // 2
-        y1 = y0 + self.CANONICAL_HEIGHT
-        x1 = x0 + self.CANONICAL_WIDTH
+        # Crop strategy:
+        # 1. Keep original width
+        # 2. Crop height to maintain 640:360 aspect ratio
+        # 3. Start from 30% down from top
+        # 4. Resize to canonical size (640x360)
         
-        self.img = img[y0:y1, x0:x1].copy()
-        print(f"Center cropped from {W}x{H} to {self.CANONICAL_WIDTH}x{self.CANONICAL_HEIGHT}")
+        # Calculate target crop height based on aspect ratio (640:360 = 16:9)
+        aspect_ratio = self.CANONICAL_WIDTH / self.CANONICAL_HEIGHT
+        crop_height = int(W / aspect_ratio)
+        
+        # Ensure crop height doesn't exceed image height
+        if crop_height > H:
+            crop_height = H
+        
+        # Start cropping from 30% down from the top
+        y0 = int(H * 0.3)
+        y1 = y0 + crop_height
+        
+        # Ensure we don't exceed image bounds
+        if y1 > H:
+            y1 = H
+            y0 = H - crop_height
+        
+        # Crop full width, calculated height starting at 30% from top
+        x0 = 0
+        x1 = W
+        
+        cropped = img[y0:y1, x0:x1].copy()
+        
+        # Resize to canonical size
+        self.img = cv2.resize(cropped, (self.CANONICAL_WIDTH, self.CANONICAL_HEIGHT))
+        print(f"Cropped from {W}x{H} (region: y={y0}:{y1}, x={x0}:{x1}) and resized to {self.CANONICAL_WIDTH}x{self.CANONICAL_HEIGHT}")
         
         self.h, self.w = self.img.shape[:2]
         self.roi = None
@@ -206,8 +236,12 @@ class ImageProcessor:
         if self.blur is None:
             self.step_blur()
         # Use Otsu's thresholding to automatically find optimal threshold
-        # This will keep white/bright pixels (lanes) and set dark pixels to black
-        _, self.binary = cv2.threshold(self.blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Add +80 offset to increase threshold (keeps only brighter pixels)
+        otsu_threshold, _ = cv2.threshold(self.blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        threshold_value = otsu_threshold + 80
+        print(f">>> threshold_value = {threshold_value} (Otsu: {otsu_threshold} + 80 offset)")
+        print(f"Keeping pixels brighter than {threshold_value}, filtering out darker areas")
+        _, self.binary = cv2.threshold(self.blur, threshold_value, 255, cv2.THRESH_BINARY)
         return self.binary
 
     def step_edges(self, use_lsd=True):
@@ -667,7 +701,7 @@ class App:
 
     def show_line_fitting(self):
         if self.lineA is None or self.lineB is None:
-            print("Run Segment Clustering first!")
+            print("[Line Fitting] Cannot proceed - no valid lines from clustering!")
             return
 
         # Use clustering visualization as background
@@ -730,7 +764,7 @@ class App:
 
     def show_pose_extraction(self):
         if self.lineA is None or self.lineB is None:
-            print("Run Segment Clustering first!")
+            print("[Pose Extraction] Cannot proceed - no valid lines from clustering!")
             return
             
         # Use fitted line visualization as background
